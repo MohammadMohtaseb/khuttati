@@ -1,7 +1,6 @@
 // Cloudflare Pages advanced-mode worker. AI writes the recipe; USDA/label data supply every number.
 const SUPABASE_URL = 'https://xrkfnfvhysxftgptkmvg.supabase.co';
 const MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
-const FDC_API = 'https://api.nal.usda.gov/fdc/v1/foods/search';
 const NUTRIENTS = {protein:1003,fat:1004,carbs:1005,water:1051};
 const json = (value,status=200) => Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
 const finite = value => Number.isFinite(Number(value)) ? Number(value) : NaN;
@@ -38,13 +37,33 @@ function foodScore(food,query,form){
   if(food.dataType==='Branded')score-=15;
   if(form==='raw')score+=d.includes('raw')?5:d.includes('cooked')?-8:0;
   if(form==='cooked')score+=/cooked|grilled|boiled|roasted|baked|fried|steamed/.test(d)?5:d.includes('raw')?-8:0;
+  if(/\band\b/.test(d)&&!/\band\b/.test(query))score-=8;
+  if(/with (?:sauce|gravy|vegetables|beans|rice)|breaded|battered|rotisserie|fat added|with added solution/.test(d))score-=15;
+  for(const detail of ['frozen','salted','sweetened','strawberry','vanilla','chobani','flavored','duck','goose','quail','turkey'])if(d.includes(detail)&&!query.toLowerCase().includes(detail))score-=7;
+  if(d.includes('fresh')&&query.toLowerCase().includes('egg'))score+=3;
   return score;
+}
+
+function rawSearch(pantry,aiQuery,cookingExpected){
+  const name=pantry.toLowerCase();
+  if(/(?:(?:صدر|صدور)\s*دجاج|دجاج\s*(?:صدر|صدور))/.test(name))return 'chicken breast boneless skinless raw';
+  if(/(?:أرز|ارز|رز)\s*(?:أبيض|ابيض)/.test(name))return 'rice white long grain raw';
+  if(/(?:أرز|ارز|رز)\s*(?:أسمر|بني)/.test(name))return 'rice brown long grain raw';
+  if(/(?:بيض|بيضة)/.test(name))return 'egg whole raw';
+  if(/(?:بطاطا|بطاطس)/.test(name))return 'potato raw';
+  if(/(?:زيت زيتون|olive oil)/.test(name))return 'oil olive salad or cooking';
+  if(/(?:زبادي|لبن|يوغورت).*يوناني|(?:yogurt|yoghurt).*greek/i.test(name))return /(?:خالي|صفر|nonfat|fat.?free)/i.test(name)?'yogurt greek plain nonfat':/(?:قليل|lowfat|low fat)/i.test(name)?'yogurt greek plain lowfat':'yogurt greek plain';
+  const query=text(aiQuery,80).replace(/\b(cooked|grilled|boiled|roasted|baked|fried)\b/ig,'').trim();
+  return cookingExpected&&!/\b(raw|uncooked|dry)\b/i.test(query)?`${query} raw`:query;
 }
 
 export function compatibleCooked(description,rawDescription,method){
   const cooked=description.toLowerCase(),raw=rawDescription.toLowerCase();
-  if(/breaded|battered|with oil|made with oil|with butter|with margarine|with added solution|with sauce/.test(cooked))return false;
-  for(const word of ['chicken','turkey','breast','thigh','rice','white','brown','pasta','salmon','tuna','potato','egg','skinless','boneless'])if(raw.includes(word)&&!cooked.includes(word))return false;
+  if(/breaded|battered|with oil|made with oil|with butter|with margarine|with added solution|with sauce|fat added|wild|rotisserie|pre-cooked/.test(cooked))return false;
+  if(cooked.includes('parboiled')&&!raw.includes('parboiled'))return false;
+  if(cooked.includes('with salt')&&!raw.includes('salt'))return false;
+  for(const word of ['chicken','turkey','breast','thigh','rice','white','brown','pasta','salmon','tuna','potato','egg'])if(raw.includes(word)&&!cooked.includes(word))return false;
+  if((raw.includes('skinless')||raw.includes('boneless'))&&!cooked.includes('meat only')&&!cooked.includes('skinless'))return false;
   if(method==='grilled'&&!/grilled|broiled/.test(cooked))return false;
   if(method==='roasted'&&!/roasted|baked/.test(cooked))return false;
   if(method==='fried'&&!/fried/.test(cooked))return false;
@@ -53,23 +72,30 @@ export function compatibleCooked(description,rawDescription,method){
   return true;
 }
 
-async function lookupFood(query,form,apiKey,rawReference='',method=''){
-  const url=new URL(FDC_API);
-  url.searchParams.set('api_key',apiKey);
-  url.searchParams.set('query',query);
-  url.searchParams.set('pageSize',form==='cooked'?'30':'12');
-  let cached;
-  try{cached=await caches.default.match(url.toString())}catch{}
-  let response=cached;
-  if(!response){
-    response=await fetch(url.toString());
-    if(!response.ok)throw new Error(response.status===429?'حدّ بيانات USDA مؤقتًا. جرّب لاحقًا.':'تعذر جلب بيانات الغذاء من USDA.');
-    try{await caches.default.put(url.toString(),new Response(await response.clone().text(),{headers:{'Cache-Control':'public, max-age=86400'}}))}catch{}
+let indexPromise;
+async function foodIndex(env,request){
+  if(!indexPromise)indexPromise=env.ASSETS.fetch(new Request(new URL('/usda-sr-legacy-2018.json',request.url))).then(r=>{
+    if(!r.ok)throw new Error('تعذر تحميل قاعدة الغذاء.');
+    return r.json();
+  }).catch(error=>{indexPromise=null;throw error});
+  return indexPromise;
+}
+
+export function lookupIndexed(index,query,form,rawReference='',method='',requiresRaw=false){
+  const terms=query.toLowerCase().split(/[^a-z]+/).filter(w=>w.length>2);
+  const scored=[];
+  for(const [fdcId,description,kcal,protein,fat,carbs,water,dataType] of index){
+    const lower=description.toLowerCase();
+    if(requiresRaw&&!/\braw\b|uncooked|\bdry\b/.test(lower))continue;
+    if(form==='cooked'&&(!/cooked|grilled|boiled|roasted|baked|fried|steamed/.test(lower)||!compatibleCooked(description,rawReference,method)))continue;
+    if(form==='raw'&&/cooked|grilled|boiled|roasted|baked|fried|steamed/.test(lower))continue;
+    const match=terms.filter(t=>lower.includes(t)).length;
+    if(terms.length&&match/terms.length<.55)continue;
+    const score=foodScore({description,dataType},query,form)+match/Math.max(terms.length,1)*3;
+    scored.push({score,food:{fdcId,description,dataType,per100:{kcal,protein,fat,carbs},water:Number.isFinite(water)?water:NaN}});
   }
-  const body=await response.json();
-  const candidates=(body.foods||[]).filter(f=>f.dataType!=='Branded'&&(form!=='cooked'||(/cooked|grilled|boiled|roasted|baked|fried|steamed/i.test(f.description)&&compatibleCooked(f.description,rawReference,method)))).map(f=>({food:normalizedFood(f),score:foodScore(f,query,form)})).filter(x=>x.food);
-  candidates.sort((a,b)=>b.score-a.score);
-  return candidates[0]?.score>=1?candidates[0].food:null;
+  scored.sort((a,b)=>b.score-a.score);
+  return scored[0]?.score>=3?scored[0].food:null;
 }
 
 export function cookedWeightEstimate(rawGrams,raw,cooked){
@@ -138,25 +164,30 @@ export async function recipeRequest(request,env){
       const rawGrams=Math.round(finite(part.rawGrams)/5)*5;
       if(!Number.isFinite(rawGrams)||rawGrams<10||rawGrams>500)throw new Error('تعذّر تحديد كمية موثوقة لإحدى المواد.');
       const label=validLabels.get(part.pantryIndex);
-      const rawQuery=text(part.rawQuery,90),cookedQuery=text(part.cookedQuery,90);
-      const raw=label?{description:`ملصق ${pantry[part.pantryIndex]}`,dataType:'Label',per100:label,water:NaN,fdcId:null}:await lookupFood(rawQuery,'raw',env.USDA_API_KEY||'DEMO_KEY');
+      const cookedQuery=text(part.cookedQuery,90);
+      const rawQuery=rawSearch(pantry[part.pantryIndex],part.rawQuery,!!cookedQuery);
+      const index=label?null:await foodIndex(env,request);
+      const raw=label?{description:`ملصق ${pantry[part.pantryIndex]}`,dataType:'Label',per100:label,water:NaN,fdcId:null}:lookupIndexed(index,rawQuery,'raw','','',!!cookedQuery);
       if(!raw)throw new Error(`لم نجد قيمة موثوقة لـ«${pantry[part.pantryIndex]}». أضف قيم الملصق لكل 100غ أو جرّب اسمًا أوضح.`);
-      const cookingMethod=(cookedQuery.match(/grilled|broiled|roasted|baked|fried|steamed|boiled/i)||[])[0]?.toLowerCase()||'';
+      const titleMethod=/مشوي|شوي|grill/i.test(suggestion.title)?'grilled':/مقلي|قلي|fried/i.test(suggestion.title)?'fried':/مخبوز|خبز|baked/i.test(suggestion.title)?'baked':'';
+      const meatLike=/chicken|turkey|beef|lamb|fish|salmon|tuna/i.test(raw.description);
+      const cookingMethod=(meatLike&&titleMethod)||(cookedQuery.match(/grilled|broiled|roasted|baked|fried|steamed|boiled/i)||[])[0]?.toLowerCase()||'';
       const derivedCookedQuery=raw.description.replace(/\braw\b/ig,'').replace(/[,]/g,' ').replace(/\s+/g,' ').trim()+' cooked';
-      const cooked=!label&&cookedQuery?await lookupFood(derivedCookedQuery,'cooked',env.USDA_API_KEY||'DEMO_KEY',raw.description,cookingMethod):null;
+      const cooked=!label&&cookedQuery?lookupIndexed(index,derivedCookedQuery,'cooked',raw.description,cookingMethod):null;
       const available=finite(part.availableGrams);
       items.push({name:text(part.nameAr,70)||pantry[part.pantryIndex],pantry:pantry[part.pantryIndex],rawGrams,cookingExpected:!!cookedQuery,
         minGrams:10,maxGrams:Number.isFinite(available)&&available>=10?Math.min(500,Math.max(rawGrams,available)):Math.min(500,Math.max(rawGrams,Math.round(rawGrams*1.5))),raw,cooked});
     }
     fitTarget(items,target);
     const output=items.map(({minGrams,maxGrams,...item})=>({...item,cookedGrams:cookedWeightEstimate(item.rawGrams,item.raw,item.cooked)}));
-    const steps=safeSteps(suggestion.steps||[],items.some(x=>/chicken|turkey/i.test(x.raw.description)));
-    return json({recipe:{title:text(suggestion.title,90),steps,ingredients:output,target,meal,estimated:true,source:'USDA FoodData Central + optional product labels'}});
+    const steps=safeSteps(suggestion.steps||[],items.some(x=>/chicken|turkey/i.test(x.raw.description)),suggestion.title);
+    return json({recipe:{title:text(suggestion.title,90),steps,ingredients:output,target,meal,estimated:true,source:'USDA FoodData Central (SR Legacy 2018 / Foundation 2026) + optional product labels'}});
   }catch(error){return json({error:error.message||'تعذر إنشاء الوصفة الآن. حاول لاحقًا.'},502)}
 }
 
-export function safeSteps(generated,poultry){
-  const steps=generated.slice(0,6).map(s=>text(s,250)).filter(s=>!(/(?:اغسل|اشطف|انقع|wash|rinse)/i.test(s)&&/(?:دجاج|لحم|سمك|chicken|meat|fish)/i.test(s)));
+export function safeSteps(generated,poultry,title=''){
+  const grilling=/مشوي|شوي|grill/i.test(title);
+  const steps=generated.slice(0,6).map(s=>text(s,250)).filter(s=>!((/(?:اغسل|اشطف|انقع|wash|rinse)/i.test(s)&&/(?:دجاج|لحم|سمك|chicken|meat|fish)/i.test(s))||(grilling&&/(?:اغمر|ضع)/i.test(s)&&/(?:صدر|دجاج|لحم|chicken|meat)/i.test(s)&&/(?:الماء|ماء)/i.test(s))));
   if(poultry)steps.push('لا تغسل الدجاج النيّئ، وافصله عن الطعام الجاهز. اطهه حتى تصل حرارته الداخلية إلى 74°م باستخدام ميزان حرارة للطعام.');
   return steps;
 }

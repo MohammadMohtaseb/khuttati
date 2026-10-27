@@ -23,5 +23,5 @@ npm run dev
 
 ## بدائل الوصفات
 
-قسم «بدائل وصفاتي» يستخدم Cloudflare Workers AI لاقتراح الوصفة وUSDA FoodData Central أو قيم الملصق التي يدخلها المستخدم لحساب السعرات والماكروز. تعرض الواجهة مقادير نيئة وقيمًا مطبوخة منفصلة، مع تعديل الوزن الفعلي بعد الطبخ. تُحفظ الوصفة في حساب Supabase عند اختيار الحفظ. للنشر، اربط Workers AI باسم AI في Cloudflare Pages؛ يستخدم الخادم USDA DEMO_KEY المحدود إن لم تضبط متغير USDA_API_KEY. لا تضع المفتاح في Git أو الواجهة. ملف _worker.js يُنتَج داخل pages-dist عند البناء.
+قسم «بدائل وصفاتي» يستخدم Cloudflare Workers AI لاقتراح الوصفة، ثم يحسب السعرات والماكروز من بيانات USDA FoodData Central المنشورة (SR Legacy 2018 وFoundation 2026) أو قيم الملصق التي يدخلها المستخدم. تعرض الواجهة مقادير نيئة وقيمًا مطبوخة منفصلة، مع تعديل الوزن الفعلي بعد الطبخ. تُحفظ الوصفة في حساب Supabase عند اختيار الحفظ. للنشر، اربط Workers AI باسم AI في Cloudflare Pages. ملفا `_worker.js` و`usda-sr-legacy-2018.json` يُنتجان داخل `pages-dist` عند البناء؛ لا يحتاج الموقع مفتاح USDA أثناء التشغيل. يمكن إعادة توليد قاعدة الغذاء المختصرة بواسطة `scripts/build-usda-index.mjs` بعد تنزيل مجموعتي JSON الرسميتين من [USDA](https://fdc.nal.usda.gov/download-datasets/) ووضعهما في `release/usda/sr/` و`release/usda/foundation/` بالأسماء الموضحة في الشفرة.
 
